@@ -1,9 +1,14 @@
 // Fake Toolcall Fix
-// Detects {"action":"GenerateImage","action_input":...} printed as plain text
-// in an AI message, strips it, and runs /sd with the extracted prompt.
+// Detects fake image tool calls printed as plain text in an AI message:
+//   {"action":"GenerateImage","action_input":"{\"prompt\":\"...\"}"}
+//   { "prompt": "..." }
+// Strips them (plus a bracketed description right before) and runs /sd.
 
 const TOOL_NAMES = ['GenerateImage', 'generate_image'];
-const START_RE = new RegExp(`\\{\\s*"action"\\s*:\\s*"(?:${TOOL_NAMES.join('|')})"`, 'g');
+const START_RE = new RegExp(
+    `\\{\\s*"(?:action"\\s*:\\s*"(?:${TOOL_NAMES.join('|')})"|prompt"\\s*:)`,
+    'g',
+);
 
 // Find the matching closing brace, respecting strings.
 function findObjectEnd(text, start) {
@@ -24,7 +29,7 @@ function findObjectEnd(text, start) {
 }
 
 function getPrompt(obj) {
-    let input = obj.action_input;
+    let input = obj.action_input ?? obj;
     if (typeof input === 'string') {
         try { input = JSON.parse(input); } catch { return input.trim(); }
     }
@@ -33,31 +38,33 @@ function getPrompt(obj) {
 
 function processText(text) {
     START_RE.lastIndex = 0;
-    const m = START_RE.exec(text);
-    if (!m) return null;
+    let m;
+    while ((m = START_RE.exec(text))) {
+        const start = m.index;
+        const end = findObjectEnd(text, start);
+        if (end < 0) continue;
 
-    const start = m.index;
-    const end = findObjectEnd(text, start);
-    if (end < 0) return null;
+        let obj;
+        try { obj = JSON.parse(text.slice(start, end)); } catch { continue; }
+        const prompt = getPrompt(obj);
+        if (!prompt) continue;
 
-    let obj;
-    try { obj = JSON.parse(text.slice(start, end)); } catch { return null; }
-    const prompt = getPrompt(obj);
-    if (!prompt) return null;
+        let s = start, e = end;
 
-    // Also swallow surrounding ``` fences if present
-    let s = start, e = end;
-    const before = text.slice(0, s).match(/```(?:json)?\s*$/);
-    const after = text.slice(e).match(/^\s*```/);
-    if (before && after) { s -= before[0].length; e += after[0].length; }
+        // Swallow surrounding ``` fences if present
+        const before = text.slice(0, s).match(/```(?:json)?\s*$/);
+        const after = text.slice(e).match(/^\s*```/);
+        if (before && after) { s -= before[0].length; e += after[0].length; }
 
-    let cleaned = text.slice(0, s) + text.slice(e);
+        // Swallow a bracketed description right before the JSON
+        // (works even if it has typos / differs slightly from the prompt)
+        const bracket = text.slice(0, s).match(/\[[^\]\n]*\]\s*$/);
+        if (bracket) s -= bracket[0].length;
 
-    // Remove the bracketed description if it just repeats the prompt
-    const esc = prompt.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    cleaned = cleaned.replace(new RegExp(`\\[\\s*${esc}\\s*\\]\\s*`, 'i'), '');
-
-    return { cleaned: cleaned.trim(), prompt };
+        const cleaned = (text.slice(0, s) + text.slice(e)).trim();
+        return { cleaned, prompt };
+    }
+    return null;
 }
 
 async function handleMessage(id) {
